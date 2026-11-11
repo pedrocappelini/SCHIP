@@ -1,12 +1,12 @@
 use std::fs::File;
 use std::io::Read;
 
-pub struct Chip8 {
+pub struct Schip {
     pub flags: [u8; 8],
     pub memory: [u8; 4096],
     register: [u8; 16],
     stack: [u16; 16],
-    pub display: [u8; 128 * 64], //made bigger for the SCHIP
+    pub display: [u64; 128],
     pub keypad: [u8; 16],
     index: u16,
     pub s_timer: u8,
@@ -18,6 +18,7 @@ pub struct Chip8 {
 }
 
 const START_ADRESS: u16 = 0x200;
+const DISPLAY_WORDS_PER_ROW: usize = 2;
 const START_FONT_ADRESS: u16 = 0x00;
 const START_BIG_FONT_ADRESS: u16 = 0x50;
 const FONTSET: [u8; 80] = [
@@ -51,7 +52,7 @@ const BIG_FONTSET: [u8; 100] = [
     0x3C, 0x7E, 0xC3, 0xC3, 0x7F, 0x3F, 0x03, 0x03, 0x3E, 0x7C, // 9
 ];
 
-impl Chip8 {
+impl Schip {
     //constructor
     pub fn new() -> Self {
         let mut memory = [0u8; 4096];
@@ -64,7 +65,7 @@ impl Chip8 {
             flags: [0; 8],
             register: [0; 16],
             stack: [0; 16],
-            display: [0; 128 * 64],
+            display: [0; 128],
             keypad: [0; 16],
             index: 0,
             s_timer: 0,
@@ -73,6 +74,47 @@ impl Chip8 {
             sp: 0,
             high_res: false,
             exit: false,
+        }
+    }
+
+    pub fn pixel(&self, x: usize, y: usize) -> bool {
+        let word = self.display[y * DISPLAY_WORDS_PER_ROW + (x / 64)];
+        word & (1u64 << (63 - (x % 64))) != 0
+    }
+
+    fn xor_sprite_segment(&mut self, x: usize, y: usize, sprite: u16, width: usize) {
+        let word_index = y * DISPLAY_WORDS_PER_ROW + (x / 64);
+        let bit_offset = x % 64;
+        let first_width = width.min(64 - bit_offset);
+        let remaining_width = width - first_width;
+
+        let first_mask = (sprite >> remaining_width) as u64;
+        let first_mask = first_mask << (64 - first_width - bit_offset);
+        let old_first = self.display[word_index];
+        if old_first & first_mask != 0 {
+            self.register[0xF] = 1;
+        }
+        self.display[word_index] ^= first_mask;
+
+        if remaining_width > 0 {
+            let second_mask = (sprite & ((1u16 << remaining_width) - 1)) as u64;
+            let second_mask = second_mask << (64 - remaining_width);
+            let old_second = self.display[word_index + 1];
+            if old_second & second_mask != 0 {
+                self.register[0xF] = 1;
+            }
+            self.display[word_index + 1] ^= second_mask;
+        }
+    }
+
+    fn draw_packed_sprite_row(&mut self, x: usize, y: usize, sprite: u16, width: usize) {
+        if x + width <= 128 {
+            self.xor_sprite_segment(x, y, sprite, width);
+        } else {
+            let first_width = 128 - x;
+            let second_width = width - first_width;
+            self.xor_sprite_segment(x, y, sprite >> second_width, first_width);
+            self.xor_sprite_segment(0, y, sprite & ((1u16 << second_width) - 1), second_width);
         }
     }
 
@@ -100,8 +142,6 @@ impl Chip8 {
         //Loading the ROM into the memory (todo: check to see if there is enough memory for the ROM).
         self.memory[START_ADRESS as usize..START_ADRESS as usize + buffer.len()]
             .copy_from_slice(&buffer);
-
-        //dbg!(&self.memory[0x200..0x2F0]);
     }
 
     pub fn cycles(&mut self) {
@@ -278,57 +318,30 @@ impl Chip8 {
                 self.register[0xF] = 0;
 
                 if n == 0 {
-                    for row in 0..16 {
-                        //if 16x16, needs two bytes
-                        let byte1 = self.memory[(self.index + (row * 2)) as usize];
-                        let byte2 = self.memory[(self.index + (row * 2) + 1) as usize];
-                        let y = (y_pos + row as usize) % height;
-
-                        //draw 1st byte
-                        for col in 0..8 {
-                            let sprite_pixel = (byte1 >> (7 - col)) & 1;
-                            if sprite_pixel == 1 {
-                                let x = (x_pos + col) % width;
-                                let screen_idx = x + (y * width);
-                                if self.display[screen_idx] == 1 {
-                                    self.register[0xF] = 1;
-                                }
-                                self.display[screen_idx] ^= 1;
-                            }
+                    if self.high_res {
+                        //high-resolution Dxy0: 16x16, two bytes per row.
+                        for row in 0..16 {
+                            let sprite = u16::from_be_bytes([
+                                self.memory[(self.index + row * 2) as usize],
+                                self.memory[(self.index + row * 2 + 1) as usize],
+                            ]);
+                            let y = (y_pos + row as usize) % height;
+                            self.draw_packed_sprite_row(x_pos, y, sprite, 16);
                         }
-
-                        //draw 2nd byte
-                        for col in 0..8 {
-                            let sprite_pixel = (byte2 >> (7 - col)) & 1;
-                            if sprite_pixel == 1 {
-                                let x = (x_pos + col + 8) % width;
-                                let screen_idx = x + (y * width);
-                                if self.display[screen_idx] == 1 {
-                                    self.register[0xF] = 1;
-                                }
-                                self.display[screen_idx] ^= 1;
-                            }
+                    } else {
+                        //low-resolution Dxy0: 8x16, one byte per row.
+                        for row in 0..16 {
+                            let sprite = self.memory[(self.index + row as u16) as usize] as u16;
+                            let y = (y_pos + row as usize) % height;
+                            self.draw_packed_sprite_row(x_pos, y, sprite, 8);
                         }
                     }
                 } else {
-                    //standard sprite
+                    //standard 8xN sprite.
                     for row in 0..n {
-                        let sprite_byte = self.memory[(self.index + row as u16) as usize];
+                        let sprite = self.memory[(self.index + row as u16) as usize] as u16;
                         let y = (y_pos + row as usize) % height;
-
-                        for col in 0..8 {
-                            let sprite_pixel = (sprite_byte >> (7 - col)) & 1;
-
-                            if sprite_pixel == 1 {
-                                let x = (x_pos + col) % width;
-                                let screen_idx = x + (y * width);
-
-                                if self.display[screen_idx] == 1 {
-                                    self.register[0xF] = 1;
-                                }
-                                self.display[screen_idx] ^= 1;
-                            }
-                        }
+                        self.draw_packed_sprite_row(x_pos, y, sprite, 8);
                     }
                 }
             }
@@ -437,58 +450,61 @@ impl Chip8 {
 
             //0x00Cn
             (0x0, 0x0, 0xC, _) => {
+                let rows = if self.high_res { 64 } else { 32 };
+                let words = if self.high_res { 2 } else { 1 };
                 let n = n4 as usize;
                 let old_display = self.display;
-                for y in n..64 {
-                    for x in 0..128 {
-                        let d_index = (y * 128) + x;
-                        let old_d_index = ((y - n) * 128) + x;
-                        self.display[d_index] = old_display[old_d_index];
-                    }
-                }
 
-                for y in 0..n {
-                    for x in 0..128 {
-                        let d_index = (y * 128) + x;
-                        self.display[d_index] = 0;
+                for y in 0..rows {
+                    for word in 0..words {
+                        let index = y * DISPLAY_WORDS_PER_ROW + word;
+                        self.display[index] = if y >= n {
+                            old_display[(y - n) * DISPLAY_WORDS_PER_ROW + word]
+                        } else {
+                            0
+                        };
                     }
                 }
             }
 
             //0x00FB
             (0x0, 0x0, 0xF, 0xB) => {
-                let old_display = self.display;
-                for y in 0..64 {
-                    for x in 4..128 {
-                        let d_index = (y * 128) + x;
-                        let old_d_index = (y * 128) + (x - 4);
-                        self.display[d_index] = old_display[old_d_index];
-                    }
-                }
+                let rows = if self.high_res { 64 } else { 32 };
+                let words = if self.high_res { 2 } else { 1 };
 
-                for y in 0..64 {
-                    for x in 0..4 {
-                        let d_index = (y * 128) + x;
-                        self.display[d_index] = 0;
+                for y in 0..rows {
+                    let index = y * DISPLAY_WORDS_PER_ROW;
+                    let old_first = self.display[index];
+                    let old_second = if words == 2 {
+                        self.display[index + 1]
+                    } else {
+                        0
+                    };
+                    self.display[index] = old_first >> 4;
+                    if words == 2 {
+                        self.display[index] |= old_second << 60;
+                        self.display[index + 1] = old_second >> 4;
                     }
                 }
             }
 
             //0x00FC
             (0x0, 0x0, 0xF, 0xC) => {
-                let old_display = self.display;
-                for y in 0..64 {
-                    for x in 0..124 {
-                        let d_index = (y * 128) + x;
-                        let old_d_index = (y * 128) + (x + 4);
-                        self.display[d_index] = old_display[old_d_index];
-                    }
-                }
+                let rows = if self.high_res { 64 } else { 32 };
+                let words = if self.high_res { 2 } else { 1 };
 
-                for y in 0..64 {
-                    for x in 124..128 {
-                        let d_index = (y * 128) + x;
-                        self.display[d_index] = 0;
+                for y in 0..rows {
+                    let index = y * DISPLAY_WORDS_PER_ROW;
+                    let old_first = self.display[index];
+                    let old_second = if words == 2 {
+                        self.display[index + 1]
+                    } else {
+                        0
+                    };
+                    self.display[index] = old_first << 4;
+                    if words == 2 {
+                        self.display[index] |= old_second >> 60;
+                        self.display[index + 1] = old_second << 4;
                     }
                 }
             }
@@ -517,7 +533,7 @@ impl Chip8 {
 
             //0xFFFF (doesn't exist on the chip8 architecture).
             (0xF, _, 0xF, 0xF) => {
-                self.display.fill(1);
+                self.display.fill(u64::MAX);
             }
             (_, _, _, _) => {
                 print!(" . ");
